@@ -52,7 +52,7 @@ if uploaded_file:
                         if src and img_tag.get("alt"):
                             existing_alt_texts[src] = img_tag.get("alt")
         except Exception as e:
-            st.error("The EPUB could not be loaded. It may be malformed or missing a required navigation file.")
+            st.error(f"The EPUB could not be loaded: {str(e)}")
             st.stop()
 
         image_files = [item for item in book.items if isinstance(item, epub.EpubImage)]
