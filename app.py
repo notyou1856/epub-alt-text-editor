@@ -14,6 +14,30 @@ st.title("EPUB and PDF Image Alt Text Editor")
 
 # EPUB validator
 
+def run_epub_validation(epub_path):
+    st.subheader("EPUB Validation Results")
+    epub_passed = True
+    try:
+        with zipfile.ZipFile(epub_path, 'r') as z:
+            namelist = z.namelist()
+            if 'META-INF/container.xml' not in namelist:
+                epub_passed = False
+                st.error("Missing container.xml file. Not a valid EPUB.")
+            if not any(name.endswith('.xhtml') or name.endswith('.html') for name in namelist):
+                st.warning("EPUB may be missing readable XHTML/HTML content.")
+            else:
+                st.success("Basic EPUB structure looks valid.")
+                st.write(f"Contains {len(namelist)} files.")
+        if epub_passed:
+            st.success("EPUB Validation Passed ✅")
+        else:
+            st.error("EPUB Validation Failed ❌")
+        return epub_passed
+    except zipfile.BadZipFile:
+        st.error("This is not a valid ZIP archive. EPUB appears corrupted.")
+        return False
+
+
 def is_valid_epub(epub_path):
     try:
         with zipfile.ZipFile(epub_path, 'r') as z:
@@ -38,6 +62,7 @@ if uploaded_file:
             temp_epub_path = tmp_file.name
 
         if not is_valid_epub(temp_epub_path):
+            run_epub_validation(temp_epub_path)
             st.error("The uploaded file is not a valid EPUB format. Please check the file and try again.")
             st.stop()
 
@@ -87,14 +112,15 @@ if uploaded_file:
 
             updated_epub_path = "updated.epub"
             try:
-                book.toc = book.toc or []
-                book.spine = ['nav'] + [item for item in book.get_items_of_type(epub.EpubHtml)]
+                book.spine = book.spine or ['nav']
                 epub.write_epub(updated_epub_path, book)
+                run_epub_validation(updated_epub_path)
                 st.success("EPUB updated with alt text successfully!")
                 with open(updated_epub_path, "rb") as f:
                     st.download_button("Download Updated EPUB", f, file_name="updated.epub")
                 st.markdown("[Click here to preview EPUB](https://futurepress.github.io/epub.js-reader/?epub=updated.epub)")
-                st.info("Note: To preview, you may need to manually upload the EPUB to an online reader if direct previewing doesn't work on Streamlit.")
+                st.info("You can preview this EPUB below if your browser supports inline EPUB viewing:")
+                st.components.v1.iframe("https://futurepress.github.io/epub.js-reader/?epub=updated.epub", height=600, scrolling=True)
             except Exception as e:
                 st.error(f"Failed to save EPUB: {str(e)}")
 
