@@ -71,6 +71,9 @@ if uploaded_file:
             existing_alt_texts = {}
             for item in book.items:
                 if item.media_type == 'application/xhtml+xml':
+                    if not item.content:
+                        st.warning(f"Skipped empty XHTML content: {item.file_name}")
+                        continue
                     soup = BeautifulSoup(item.content.decode("utf-8"), "html.parser")
                     for img_tag in soup.find_all("img"):
                         src = img_tag.get("src")
@@ -112,6 +115,8 @@ if uploaded_file:
 
             updated_epub_path = "updated.epub"
             try:
+                book.add_item(epub.EpubNav())
+                book.add_item(epub.EpubNcx())
                 book.spine = book.spine or ['nav']
                 epub.write_epub(updated_epub_path, book)
                 run_epub_validation(updated_epub_path)
