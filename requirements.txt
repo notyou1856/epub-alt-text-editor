@@ -4,3 +4,4 @@ ebooklib
 pillow
 pymupdf
 boto3
+beautifulsoup4
