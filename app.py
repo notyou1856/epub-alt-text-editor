@@ -23,7 +23,12 @@ if uploaded_file:
             tmp_file.write(uploaded_file.read())
             temp_epub_path = tmp_file.name
 
-        book = epub.read_epub(temp_epub_path)
+        try:
+            book = epub.read_epub(temp_epub_path)
+        except Exception as e:
+            st.error("The EPUB could not be loaded. It may be invalid or missing a required navigation file.")
+            st.stop()
+
         image_files = [item for item in book.items if isinstance(item, epub.EpubImage)]
 
         st.subheader(f"Extracted {len(image_files)} images from EPUB")
