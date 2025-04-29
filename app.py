@@ -1,6 +1,7 @@
 import streamlit as st
 from ebooklib import epub
 from PIL import Image
+from bs4 import BeautifulSoup
 import fitz  # pymupdf
 import io
 import os
@@ -16,10 +17,10 @@ if uploaded_file:
     alt_texts = {}
 
     if file_type == "epub":
-        # Save and process EPUB
         epub_path = "temp.epub"
         with open(epub_path, "wb") as f:
             f.write(uploaded_file.read())
+
         book = epub.read_epub(epub_path)
         image_files = [item for item in book.items if isinstance(item, epub.EpubImage)]
 
@@ -29,22 +30,35 @@ if uploaded_file:
             alt_text = st.text_input(f"Enter alt text for Image {idx+1}", max_chars=30)
             alt_texts[img.file_name] = alt_text
 
+
         if st.button("Save Updated EPUB"):
-            for img in image_files:
-                if img.file_name in alt_texts and alt_texts[img.file_name].strip():
-                    img.set_content(b"<!-- ALT: " + alt_texts[img.file_name].encode() + b" -->" + img.content)
+            for item in book.items:
+                if item.media_type == 'application/xhtml+xml':
+                    soup = BeautifulSoup(item.content, "html.parser")
+                    for img_tag in soup.find_all("img"):
+                        src = img_tag.get("src")
+                        if src in alt_texts and alt_texts[src]:
+                            img_tag["alt"] = alt_texts[src]
+                    item.content = str(soup).encode()
+
             updated_epub_path = "updated.epub"
             epub.write_epub(updated_epub_path, book)
-            st.success("EPUB updated successfully!")
-            st.download_button("Download Updated EPUB", open(updated_epub_path, "rb"), file_name="updated.epub")
+            st.success("EPUB updated with alt text successfully!")
+            with open(updated_epub_path, "rb") as f:
+                 st.download_button("Download Updated EPUB", f, file_name="updated.epub")
+
+            st.markdown("[Click here to preview EPUB](https://futurepress.github.io/epub.js-reader/?epub=updated.epub)")
+            st.info("Note: To preview, you may need to manually upload the EPUB to an online reader if direct previewing doesn't work on Streamlit.")
+
 
     elif file_type == "pdf":
-        # Save and process PDF
         pdf_path = "temp.pdf"
         with open(pdf_path, "wb") as f:
             f.write(uploaded_file.read())
+
         doc = fitz.open(pdf_path)
         image_counter = 0
+
         for page_index in range(len(doc)):
             page = doc[page_index]
             image_list = page.get_images(full=True)
@@ -58,4 +72,4 @@ if uploaded_file:
                 image_counter += 1
 
         st.subheader(f"Extracted {image_counter} images from PDF")
-        st.info("Note: PDF alt text saving is not supported in this version.")
+        st.info("Note: PDF alt text saving is not yet supported.")
