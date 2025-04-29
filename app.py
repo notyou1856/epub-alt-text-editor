@@ -1,14 +1,29 @@
 import streamlit as st
 from ebooklib import epub
 from bs4 import BeautifulSoup
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 import fitz  # pymupdf
 import io
 import os
+import zipfile
 import tempfile
+import html
 
 # Title
 st.title("EPUB and PDF Image Alt Text Editor")
+
+# EPUB validator
+
+def is_valid_epub(epub_path):
+    try:
+        with zipfile.ZipFile(epub_path, 'r') as z:
+            required_files = ['META-INF/container.xml']
+            for req_file in required_files:
+                if req_file not in z.namelist():
+                    return False
+            return True
+    except:
+        return False
 
 # Upload File
 uploaded_file = st.file_uploader("Upload an EPUB or PDF file", type=["epub", "pdf"])
@@ -18,24 +33,46 @@ if uploaded_file:
     alt_texts = {}
 
     if file_type == "epub":
-        # Save uploaded EPUB to a temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp_file:
             tmp_file.write(uploaded_file.read())
             temp_epub_path = tmp_file.name
 
+        if not is_valid_epub(temp_epub_path):
+            st.error("The uploaded file is not a valid EPUB format. Please check the file and try again.")
+            st.stop()
+
         try:
             book = epub.read_epub(temp_epub_path)
+            existing_alt_texts = {}
+            for item in book.items:
+                if item.media_type == 'application/xhtml+xml':
+                    soup = BeautifulSoup(item.content.decode("utf-8"), "html.parser")
+                    for img_tag in soup.find_all("img"):
+                        src = img_tag.get("src")
+                        if src and img_tag.get("alt"):
+                            existing_alt_texts[src] = img_tag.get("alt")
         except Exception as e:
-            st.error("The EPUB could not be loaded. It may be invalid or missing a required navigation file.")
+            st.error("The EPUB could not be loaded. It may be malformed or missing a required navigation file.")
             st.stop()
 
         image_files = [item for item in book.items if isinstance(item, epub.EpubImage)]
 
         st.subheader(f"Extracted {len(image_files)} images from EPUB")
         for idx, img in enumerate(image_files):
-            st.image(io.BytesIO(img.content), caption=f"Image {idx+1}")
-            alt_text = st.text_input(f"Enter alt text for Image {idx+1}", max_chars=30, key=f"alt-{idx}")
+            if hasattr(img, "media_type") and img.media_type in ["image/jpeg", "image/png", "image/gif"]:
+                try:
+                    test_image = Image.open(io.BytesIO(img.content))
+                    test_image.verify()
+                    st.image(io.BytesIO(img.content), caption=f"Image {idx+1}")
+                except (UnidentifiedImageError, Exception):
+                    st.warning(f"Image {idx+1} could not be displayed (possibly corrupted or unsupported format).")
+            else:
+                st.warning(f"Image {idx+1} is not a supported format.")
+            default_alt = existing_alt_texts.get(img.file_name, "")
+            alt_text = st.text_input(f"Enter alt text for Image {idx+1}", max_chars=30, key=f"alt-{idx}", value=default_alt)
             alt_texts[img.file_name] = alt_text
+
+        
 
         if st.button("Save Updated EPUB"):
             for item in book.items:
@@ -44,20 +81,24 @@ if uploaded_file:
                     for img_tag in soup.find_all("img"):
                         src = img_tag.get("src")
                         if src in alt_texts and alt_texts[src]:
-                            img_tag["alt"] = alt_texts[src]
+                            clean_alt = html.escape(alt_texts[src].strip())
+                            img_tag["alt"] = clean_alt
                     item.content = str(soup).encode("utf-8")
 
             updated_epub_path = "updated.epub"
-            epub.write_epub(updated_epub_path, book)
-            st.success("EPUB updated with alt text successfully!")
-            with open(updated_epub_path, "rb") as f:
-                st.download_button("Download Updated EPUB", f, file_name="updated.epub")
-
-            st.markdown("[Click here to preview EPUB](https://futurepress.github.io/epub.js-reader/?epub=updated.epub)")
-            st.info("Note: To preview, you may need to manually upload the EPUB to an online reader if direct previewing doesn't work on Streamlit.")
+            try:
+                book.toc = book.toc or []
+                book.spine = ['nav'] + [item for item in book.get_items_of_type(epub.EpubHtml)]
+                epub.write_epub(updated_epub_path, book)
+                st.success("EPUB updated with alt text successfully!")
+                with open(updated_epub_path, "rb") as f:
+                    st.download_button("Download Updated EPUB", f, file_name="updated.epub")
+                st.markdown("[Click here to preview EPUB](https://futurepress.github.io/epub.js-reader/?epub=updated.epub)")
+                st.info("Note: To preview, you may need to manually upload the EPUB to an online reader if direct previewing doesn't work on Streamlit.")
+            except Exception as e:
+                st.error(f"Failed to save EPUB: {str(e)}")
 
     elif file_type == "pdf":
-        # Save uploaded PDF to a temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
             tmp_file.write(uploaded_file.read())
             temp_pdf_path = tmp_file.name
