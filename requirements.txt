@@ -1,3 +1,5 @@
 streamlit
+ebooklib
 beautifulsoup4
 lxml
+Pillow
