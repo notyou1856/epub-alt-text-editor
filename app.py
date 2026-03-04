@@ -1,115 +1,277 @@
+
 import streamlit as st
-from ebooklib import epub, ITEM_IMAGE, ITEM_DOCUMENT
-from PIL import Image
+from ebooklib import epub
+from ebooklib import ITEM_DOCUMENT
 from bs4 import BeautifulSoup
+from PIL import Image, UnidentifiedImageError
+
 import io
 import os
+import posixpath
+import tempfile
+import urllib.parse
+from typing import Dict, List, Tuple, Any
 
-st.set_page_config(page_title="EPUB Image Alt Text Editor", layout="wide")
-st.title("EPUB Image Alt Text Editor")
+
+# ----------------------------
+# Page config
+# ----------------------------
+st.set_page_config(page_title="EPUB Alt Text Editor (MVP)", layout="wide")
+st.title("📘 EPUB Alt Text Editor (Single-Image Paging MVP)")
+
+
+# ----------------------------
+# SAFE EPUB LOADER
+# ----------------------------
+def safe_read_epub(path):
+    """Attempt to load EPUB ignoring bad TOC files (common publisher issue)."""
+    try:
+        return epub.read_epub(
+            path,
+            options={
+                "ignore_ncx": True,
+                "ignore_nav": True
+            }
+        )
+    except Exception:
+        return epub.read_epub(path)
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def norm_href(href: str) -> str:
+    if href is None:
+        return ""
+    href = href.strip()
+    href = urllib.parse.unquote(href)
+    href = href.replace("\\", "/")
+    href = href.split("#", 1)[0].split("?", 1)[0]
+    href = posixpath.normpath(href)
+    if href == ".":
+        href = ""
+    return href.lstrip("./")
+
+
+def resolve_img_href(doc_href: str, img_src: str) -> str:
+    doc_dir = posixpath.dirname(norm_href(doc_href))
+    src = norm_href(img_src)
+    if not src:
+        return ""
+    if doc_dir:
+        return norm_href(posixpath.join(doc_dir, src))
+    return src
+
+
+def build_manifest_image_map(book: epub.EpubBook) -> Dict[str, epub.EpubItem]:
+    m: Dict[str, epub.EpubItem] = {}
+    for item in book.get_items():
+        mt = getattr(item, "media_type", "") or ""
+        if mt.startswith("image/"):
+            m[norm_href(getattr(item, "file_name", "") or "")] = item
+    return m
+
+
+def safe_render_image(image_bytes: bytes):
+    im = Image.open(io.BytesIO(image_bytes))
+    im.verify()
+    im = Image.open(io.BytesIO(image_bytes))
+    return im
+
+
+def extract_image_entries(book: epub.EpubBook) -> Tuple[List[Dict[str, Any]], Dict[str, epub.EpubItem]]:
+    doc_items = list(book.get_items_of_type(ITEM_DOCUMENT))
+    manifest_images = build_manifest_image_map(book)
+
+    entries: List[Dict[str, Any]] = []
+    for doc in doc_items:
+        doc_href = getattr(doc, "file_name", "") or ""
+
+        try:
+            raw = doc.get_content()
+            html = raw.decode("utf-8", errors="ignore")
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception:
+            continue
+
+        for img in soup.find_all("img"):
+            src = img.get("src", "")
+            if not src:
+                continue
+
+            resolved = resolve_img_href(doc_href, src)
+            alt = (img.get("alt") or "").strip()
+
+            occ_idx = len([e for e in entries if e.get("doc_href") == norm_href(doc_href) and e.get("src") == norm_href(src)])
+            key = f"{norm_href(doc_href)}|{norm_href(src)}|{occ_idx}"
+
+            entries.append({
+                "key": key,
+                "doc_href": norm_href(doc_href),
+                "src": norm_href(src),
+                "resolved_href": resolved,
+                "existing_alt": alt,
+            })
+
+    return entries, manifest_images
+
+
+def apply_updates_to_book(book: epub.EpubBook, updates: Dict[str, Dict[str, Any]]) -> Tuple[int, int]:
+    doc_items = list(book.get_items_of_type(ITEM_DOCUMENT))
+    docs_modified = 0
+    tags_modified = 0
+
+    for doc in doc_items:
+
+        doc_href = norm_href(getattr(doc, "file_name", "") or "")
+
+        try:
+            html = doc.get_content().decode("utf-8", errors="ignore")
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception:
+            continue
+
+        changed_doc = False
+        seen_counts: Dict[str, int] = {}
+
+        for img in soup.find_all("img"):
+
+            src = norm_href(img.get("src", "") or "")
+            if not src:
+                continue
+
+            occ = seen_counts.get(src, 0)
+            seen_counts[src] = occ + 1
+
+            key = f"{doc_href}|{src}|{occ}"
+
+            if key not in updates:
+                continue
+
+            alt = (updates[key].get("alt") or "").strip()
+
+            if img.get("alt") != alt:
+                img["alt"] = alt
+                changed_doc = True
+                tags_modified += 1
+
+        if changed_doc:
+            doc.set_content(str(soup).encode("utf-8"))
+            docs_modified += 1
+
+    return docs_modified, tags_modified
+
 
 uploaded_file = st.file_uploader("Upload an EPUB file", type=["epub"])
 
+if "entries" not in st.session_state:
+    st.session_state.entries = []
+
+if "updates" not in st.session_state:
+    st.session_state.updates = {}
+
+if "img_index" not in st.session_state:
+    st.session_state.img_index = 0
+
+if "book_bytes" not in st.session_state:
+    st.session_state.book_bytes = None
+
+
+def reset_for_new_upload(epub_bytes):
+
+    st.session_state.book_bytes = epub_bytes
+    st.session_state.img_index = 0
+    st.session_state.updates = {}
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
+        tmp.write(epub_bytes)
+        tmp_path = tmp.name
+
+    book = safe_read_epub(tmp_path)
+
+    entries, manifest = extract_image_entries(book)
+
+    st.session_state.entries = entries
+    st.session_state.manifest_images = manifest
+
+    for e in entries:
+        st.session_state.updates[e["key"]] = {
+            "alt": e.get("existing_alt", "")
+        }
+
+
 if uploaded_file:
-    epub_path = "temp.epub"
-    with open(epub_path, "wb") as f:
-        f.write(uploaded_file.read())
 
-    book = epub.read_epub(epub_path)
-    image_items = list(book.get_items_of_type(ITEM_IMAGE))
-    st.subheader(f"Extracted {len(image_items)} images")
+    epub_bytes = uploaded_file.getvalue()
 
-    alt_texts = {}
+    if st.session_state.book_bytes != epub_bytes:
+        reset_for_new_upload(epub_bytes)
 
-    if image_items:
-        cols_per_row = 2
-        rows = (len(image_items) + cols_per_row - 1) // cols_per_row
-        idx = 0
-        for _ in range(rows):
-            row_cols = st.columns(cols_per_row)
-            for c in row_cols:
-                if idx >= len(image_items):
-                    break
-                img_item = image_items[idx]
+    entries = st.session_state.entries
+    updates = st.session_state.updates
+    manifest_images = st.session_state.manifest_images
 
-                # 🛡 Try to load image safely
-                try:
-                    if img_item.media_type in ["image/jpeg", "image/png", "image/gif"]:
-                        img_bytes = img_item.get_content()
-                        c.image(io.BytesIO(img_bytes), caption=f"{img_item.file_name}")
-                    else:
-                        c.warning(f"Unsupported format: {img_item.media_type}")
-                except Exception as e:
-                    c.warning(f"Preview not available: {img_item.file_name} — {str(e)}")
+    if not entries:
+        st.error("No images found.")
+        st.stop()
 
-                key = f"alt_{idx}"
-                alt_texts[img_item.file_name] = c.text_input(
-                    f"Alt text for: {os.path.basename(img_item.file_name)}",
-                    value="",
-                    max_chars=150,
-                    key=key,
-                    help="Describe the image succinctly. This will be written to the <img alt='...'> attribute."
-                )
-                idx += 1
+    total = len(entries)
+    idx = st.session_state.img_index
 
-    # Save Updated EPUB
-    if st.button("Save Updated EPUB"):
-        def norm_epub_path(p: str) -> str:
-            return p.replace("\\", "/")
+    col1, col2 = st.columns(2)
 
-        alt_by_path = {norm_epub_path(k): v.strip() for k, v in alt_texts.items() if v and v.strip()}
-        doc_items = list(book.get_items_of_type(ITEM_DOCUMENT))
-        updated_count = 0
-        img_tags_touched = 0
+    with col1:
+        if st.button("Prev") and idx > 0:
+            st.session_state.img_index -= 1
 
-        for doc in doc_items:
-            try:
-                html = doc.get_content().decode("utf-8", errors="ignore")
-                soup = BeautifulSoup(html, "html.parser")
-                changed = False
-                for img in soup.find_all("img"):
-                    src = img.get("src", "")
-                    if not src:
-                        continue
-                    src_norm = norm_epub_path(src)
-                    if src_norm in alt_by_path:
-                        new_alt = alt_by_path[src_norm]
-                    else:
-                        new_alt = None
-                        src_base = os.path.basename(src_norm)
-                        for k, v in alt_by_path.items():
-                            if os.path.basename(k) == src_base:
-                                new_alt = v
-                                break
-                    if new_alt:
-                        if img.get("alt") != new_alt:
-                            img["alt"] = new_alt
-                            img["title"] = new_alt
-                            changed = True
-                            img_tags_touched += 1
-                if changed:
-                    doc.set_content(str(soup).encode("utf-8"))
-                    updated_count += 1
-            except Exception as e:
-                st.warning(f"Could not update {doc.file_name}: {e}")
+    with col2:
+        if st.button("Next") and idx < total - 1:
+            st.session_state.img_index += 1
 
-        updated_epub_path = "updated.epub"
-        epub.write_epub(updated_epub_path, book)
-        st.success(f"EPUB updated: {updated_count} XHTML file(s) modified, {img_tags_touched} <img> tag(s) updated.")
+    entry = entries[st.session_state.img_index]
+    key = entry["key"]
 
-        with open(updated_epub_path, "rb") as f:
-            st.download_button(
-                "Download Updated EPUB",
-                data=f,
-                file_name="updated.epub",
-                mime="application/epub+zip"
-            )
+    st.write(f"Image {st.session_state.img_index+1} of {total}")
+    st.write(f"Path: {entry['resolved_href']}")
 
-        # ✅ Embed preview (OUTSIDE the file context)
-        st.markdown("### Preview EPUB (external viewer)")
-        viewer_url = "https://futurepress.github.io/epub.js-reader/?epub=updated.epub"
-        st.components.v1.iframe(viewer_url, height=600, scrolling=True)
+    img_item = manifest_images.get(entry["resolved_href"])
 
-            
+    if img_item:
+        try:
+            img_bytes = img_item.get_content()
+            pil_img = safe_render_image(img_bytes)
+            st.image(pil_img, width=450)
+        except UnidentifiedImageError:
+            st.warning("Image could not render.")
 
+    alt = st.text_area("Alt Text", value=updates[key]["alt"], height=120)
 
+    updates[key] = {"alt": alt}
+
+    st.markdown("---")
+
+    if st.button("💾 Save updated EPUB"):
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
+            tmp.write(st.session_state.book_bytes)
+            tmp_path = tmp.name
+
+        book = safe_read_epub(tmp_path)
+
+        docs_modified, tags_modified = apply_updates_to_book(book, updates)
+
+        output = io.BytesIO()
+        epub.write_epub(output, book)
+        output.seek(0)
+
+        st.success(f"Saved. Docs modified: {docs_modified}, images updated: {tags_modified}")
+
+        st.download_button(
+            "Download EPUB",
+            data=output,
+            file_name="updated.epub",
+            mime="application/epub+zip"
+        )
+
+else:
+    st.info("Upload an EPUB to begin.")

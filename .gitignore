@@ -1,0 +1,32 @@
+# RStudio
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# secrets
+.env
+*.key
+*.pem
+
+# mac/windows
+.DS_Store
+Thumbs.db
+
+# local test files
+*.epub
+*.pdf
+
+# streamlit
+.streamlit/secrets.toml
+
+# local job workspace
+jobs/
+temp_epub/
