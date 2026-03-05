@@ -41,17 +41,24 @@ def safe_read_epub(path):
 # Helpers
 # ----------------------------
 def norm_href(href: str) -> str:
+    """Normalize an EPUB internal href without breaking ../ traversal."""
     if href is None:
         return ""
     href = href.strip()
     href = urllib.parse.unquote(href)
     href = href.replace("\\", "/")
+    # Drop fragment and query
     href = href.split("#", 1)[0].split("?", 1)[0]
+    # Normalize path but keep leading ../ if present
     href = posixpath.normpath(href)
     if href == ".":
         href = ""
-    return href.lstrip("./")
-
+    # Remove leading ./ only (do NOT strip ../)
+    while href.startswith("./"):
+        href = href[2:]
+    # EPUB internal paths are typically relative and should not start with /
+    href = href.lstrip("/")
+    return href
 
 def resolve_img_href(doc_href: str, img_src: str) -> str:
     doc_dir = posixpath.dirname(norm_href(doc_href))
