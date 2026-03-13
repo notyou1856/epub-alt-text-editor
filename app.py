@@ -1,9 +1,11 @@
 import base64
+import hashlib
 import io
 import mimetypes
 import os
 import posixpath
 import tempfile
+import time
 import urllib.parse
 from typing import Any, Dict, List, Tuple
 
@@ -95,6 +97,20 @@ def safe_render_image(image_bytes: bytes):
     return image
 
 
+def image_bytes_hash(image_bytes: bytes) -> str:
+    return hashlib.sha256(image_bytes).hexdigest()
+
+
+def normalize_alt_text(text: str, max_words: int = 30) -> str:
+    cleaned = " ".join((text or "").strip().split())
+    if not cleaned:
+        return ""
+    words = cleaned.split()
+    if len(words) <= max_words:
+        return cleaned
+    return " ".join(words[:max_words])
+
+
 def generate_alt_text_suggestion(image_bytes: bytes, image_path: str = "") -> str:
     mime_type = mimetypes.guess_type(image_path)[0] or "image/jpeg"
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
@@ -122,7 +138,18 @@ def generate_alt_text_suggestion(image_bytes: bytes, image_path: str = "") -> st
         ],
     )
 
-    return (response.output_text or "").strip()
+    return normalize_alt_text(response.output_text or "")
+
+
+def generate_alt_text_with_cache(image_bytes: bytes, image_path: str = "") -> Tuple[str, bool]:
+    img_hash = image_bytes_hash(image_bytes)
+    cached_value = st.session_state.ai_alt_cache.get(img_hash)
+    if cached_value is not None:
+        return cached_value, True
+
+    suggestion = generate_alt_text_suggestion(image_bytes, image_path)
+    st.session_state.ai_alt_cache[img_hash] = suggestion
+    return suggestion, False
 
 
 def extract_image_entries(
@@ -203,7 +230,7 @@ def apply_updates_to_book(
             if key not in updates:
                 continue
 
-            alt = (updates[key].get("alt") or "").strip()
+            alt = normalize_alt_text(updates[key].get("alt") or "")
             if img.get("alt") != alt:
                 img["alt"] = alt
                 changed_doc = True
@@ -464,6 +491,9 @@ if "manifest_images" not in st.session_state:
 if "ai_status" not in st.session_state:
     st.session_state.ai_status = {}
 
+if "ai_alt_cache" not in st.session_state:
+    st.session_state.ai_alt_cache = {}
+
 
 # ----------------------------
 # Upload/reset helpers
@@ -500,8 +530,49 @@ def reset_for_new_upload(epub_bytes: bytes) -> None:
 
     for entry in entries:
         st.session_state.updates[entry["key"]] = {
-            "alt": entry.get("existing_alt", "")
+            "alt": normalize_alt_text(entry.get("existing_alt", ""))
         }
+
+
+def generate_missing_alt_text(entries, updates, manifest_images) -> Tuple[int, int, int]:
+    generated = 0
+    reused_cache = 0
+    skipped = 0
+
+    for entry in entries:
+        key = entry["key"]
+        current_alt = normalize_alt_text(updates.get(key, {}).get("alt") or "")
+        existing_alt = normalize_alt_text(entry.get("existing_alt", "") or "")
+
+        if current_alt or existing_alt:
+            skipped += 1
+            continue
+
+        img_item = manifest_images.get(entry["resolved_href"])
+        if not img_item:
+            skipped += 1
+            continue
+
+        image_bytes = img_item.get_content()
+        suggestion, from_cache = generate_alt_text_with_cache(
+            image_bytes, entry["resolved_href"]
+        )
+        suggestion = normalize_alt_text(suggestion)
+
+        updates[key] = {"alt": suggestion}
+        text_key = f"alt_text_{key}"
+        if text_key in st.session_state:
+            st.session_state[text_key] = suggestion
+
+        st.session_state.ai_status[key] = "cached" if from_cache else "generated"
+
+        if from_cache:
+            reused_cache += 1
+        else:
+            generated += 1
+            time.sleep(0.4)
+
+    return generated, reused_cache, skipped
 
 
 # ----------------------------
@@ -534,6 +605,25 @@ if uploaded_file:
             st.session_state.img_index += 1
             st.rerun()
 
+    bulk_col1, bulk_col2 = st.columns(2)
+    with bulk_col1:
+        if st.button("✨ Generate missing alt text only"):
+            try:
+                with st.spinner("Generating alt text for missing images..."):
+                    generated, reused_cache, skipped = generate_missing_alt_text(
+                        entries, updates, manifest_images
+                    )
+                st.success(
+                    f"Done. New AI suggestions: {generated}. Reused from cache: {reused_cache}. Skipped: {skipped}."
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Bulk alt text generation failed: {exc}")
+    with bulk_col2:
+        st.caption(
+            f"AI cache entries in this session: {len(st.session_state.ai_alt_cache)}"
+        )
+
     entry = entries[st.session_state.img_index]
     key = entry["key"]
 
@@ -548,18 +638,21 @@ if uploaded_file:
             st.image(pil_img, width=450)
         except UnidentifiedImageError:
             st.warning("Image could not render.")
+            img_bytes = b""
     else:
         st.warning("Image file was not found in the EPUB manifest.")
+        img_bytes = b""
 
     text_key = f"alt_text_{key}"
     pending_key = f"pending_ai_{key}"
 
     if text_key not in st.session_state:
-        st.session_state[text_key] = updates[key]["alt"]
+        st.session_state[text_key] = normalize_alt_text(updates[key]["alt"])
 
     if pending_key in st.session_state:
-        st.session_state[text_key] = st.session_state[pending_key]
-        updates[key] = {"alt": st.session_state[pending_key]}
+        pending_value = normalize_alt_text(st.session_state[pending_key])
+        st.session_state[text_key] = pending_value
+        updates[key] = {"alt": pending_value}
         del st.session_state[pending_key]
 
     st.text_area("Alt Text", key=text_key, height=120)
@@ -572,13 +665,15 @@ if uploaded_file:
             else:
                 try:
                     with st.spinner("Generating alt text suggestion..."):
-                        suggestion = generate_alt_text_suggestion(
+                        suggestion, from_cache = generate_alt_text_with_cache(
                             img_item.get_content(), entry["resolved_href"]
                         )
 
                     if suggestion:
-                        st.session_state[pending_key] = suggestion
-                        st.session_state.ai_status[key] = "generated"
+                        st.session_state[pending_key] = normalize_alt_text(suggestion)
+                        st.session_state.ai_status[key] = (
+                            "cached" if from_cache else "generated"
+                        )
                         st.rerun()
                     else:
                         st.session_state.ai_status[key] = "empty"
@@ -592,7 +687,13 @@ if uploaded_file:
             st.session_state[pending_key] = ""
             st.rerun()
 
-    updates[key] = {"alt": st.session_state[text_key]}
+    updates[key] = {"alt": normalize_alt_text(st.session_state[text_key])}
+
+    status = st.session_state.ai_status.get(key)
+    if status == "cached":
+        st.caption("Suggestion loaded from cache.")
+    elif status == "generated":
+        st.caption("Suggestion generated by AI.")
 
     st.markdown("---")
 
