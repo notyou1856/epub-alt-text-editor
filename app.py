@@ -291,24 +291,154 @@ def sanitize_book_for_write(book: epub.EpubBook) -> Tuple[epub.EpubBook, List[st
     return book, notes
 
 
+def sanitize_spine(book: epub.EpubBook) -> Tuple[epub.EpubBook, List[str]]:
+    """Normalize spine entries into XML-safe strings so ebooklib can serialize them."""
+    notes: List[str] = []
+    original_spine = list(getattr(book, "spine", []) or [])
+    clean_spine: List[Any] = []
+    changed = False
+
+    for entry in original_spine:
+        if isinstance(entry, str):
+            value = entry.strip()
+            if value:
+                clean_spine.append(value)
+            else:
+                changed = True
+            continue
+
+        if isinstance(entry, tuple):
+            if not entry:
+                changed = True
+                continue
+
+            first = entry[0]
+            if hasattr(first, "id") and getattr(first, "id", None):
+                idref = str(first.id)
+            elif first is None:
+                idref = ""
+            else:
+                idref = str(first).strip()
+
+            if not idref:
+                changed = True
+                continue
+
+            attrs: Dict[str, str] = {}
+            if len(entry) > 1:
+                second = entry[1]
+
+                if isinstance(second, dict):
+                    for k, v in second.items():
+                        if k is None or v is None:
+                            changed = True
+                            continue
+                        key = str(k).strip()
+                        if not key:
+                            changed = True
+                            continue
+                        if isinstance(v, bool):
+                            attrs[key] = "yes" if v else "no"
+                            changed = True
+                        else:
+                            attrs[key] = str(v)
+                elif isinstance(second, str):
+                    attrs["linear"] = "no" if second.strip().lower() == "no" else "yes"
+                    changed = True
+                elif isinstance(second, bool):
+                    attrs["linear"] = "yes" if second else "no"
+                    changed = True
+                elif second is not None:
+                    attrs["linear"] = str(second)
+                    changed = True
+
+            clean_spine.append((idref, attrs) if attrs else idref)
+            if idref != first or attrs:
+                changed = True
+            continue
+
+        if hasattr(entry, "id") and getattr(entry, "id", None):
+            clean_spine.append(str(entry.id))
+            changed = True
+            continue
+
+        changed = True
+
+    if clean_spine:
+        book.spine = clean_spine
+        if changed:
+            notes.append("Saved with spine sanitization applied.")
+
+    return book, notes
+
+
+def rebuild_spine_from_documents(book: epub.EpubBook) -> Tuple[epub.EpubBook, bool]:
+    """Rebuild the spine from XHTML documents when publisher spine metadata is malformed."""
+    doc_ids: List[str] = []
+
+    for item in book.get_items():
+        item_id = getattr(item, "id", None)
+        media_type = getattr(item, "media_type", "") or ""
+        if media_type == "application/xhtml+xml" and item_id:
+            doc_ids.append(str(item_id))
+
+    if not doc_ids:
+        return book, False
+
+    if "nav" in doc_ids:
+        doc_ids = ["nav"] + [item_id for item_id in doc_ids if item_id != "nav"]
+
+    book.spine = doc_ids
+    return book, True
+
+
 def write_book_with_fallbacks(book: epub.EpubBook) -> Tuple[io.BytesIO, List[str]]:
-    """Write EPUB and fall back to dropping TOC if publisher metadata is malformed."""
+    """Write EPUB with defensive fallbacks for malformed TOC and spine metadata."""
     book, notes = sanitize_book_for_write(book)
+    book, spine_notes = sanitize_spine(book)
+    notes.extend(spine_notes)
+
     output = io.BytesIO()
+    errors: List[str] = []
 
     try:
         epub.write_epub(output, book)
         output.seek(0)
         return output, notes
-    except Exception:
+    except Exception as exc:
+        errors.append(f"initial save failed: {exc}")
+
+    try:
         book.toc = tuple()
         if "Saved with TOC cleanup applied." not in notes:
             notes.append("Saved with TOC cleanup applied.")
         notes.append("Publisher TOC metadata was too malformed to preserve fully, so the TOC was flattened for export.")
+
         output = io.BytesIO()
         epub.write_epub(output, book)
         output.seek(0)
         return output, notes
+    except Exception as exc:
+        errors.append(f"save after TOC flatten failed: {exc}")
+
+    rebuilt, rebuilt_ok = rebuild_spine_from_documents(book)
+    if rebuilt_ok:
+        book = rebuilt
+        book, more_spine_notes = sanitize_spine(book)
+        for note in more_spine_notes:
+            if note not in notes:
+                notes.append(note)
+        notes.append("Publisher spine metadata was rebuilt from document order for export.")
+
+        try:
+            output = io.BytesIO()
+            epub.write_epub(output, book)
+            output.seek(0)
+            return output, notes
+        except Exception as exc:
+            errors.append(f"save after spine rebuild failed: {exc}")
+
+    raise RuntimeError(" | ".join(errors))
 
 
 # ----------------------------
@@ -467,24 +597,27 @@ if uploaded_file:
     st.markdown("---")
 
     if st.button("💾 Save updated EPUB"):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
-            tmp.write(st.session_state.book_bytes)
-            tmp_path = tmp.name
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
+                tmp.write(st.session_state.book_bytes)
+                tmp_path = tmp.name
 
-        book = safe_read_epub(tmp_path)
-        docs_modified, tags_modified = apply_updates_to_book(book, updates)
-        output, save_notes = write_book_with_fallbacks(book)
+            book = safe_read_epub(tmp_path)
+            docs_modified, tags_modified = apply_updates_to_book(book, updates)
+            output, save_notes = write_book_with_fallbacks(book)
 
-        success_msg = f"Saved. Docs modified: {docs_modified}, images updated: {tags_modified}"
-        st.success(success_msg)
-        for note in save_notes:
-            st.info(note)
+            success_msg = f"Saved. Docs modified: {docs_modified}, images updated: {tags_modified}"
+            st.success(success_msg)
+            for note in save_notes:
+                st.info(note)
 
-        st.download_button(
-            "Download EPUB",
-            data=output,
-            file_name="updated.epub",
-            mime="application/epub+zip",
-        )
+            st.download_button(
+                "Download EPUB",
+                data=output,
+                file_name="updated.epub",
+                mime="application/epub+zip",
+            )
+        except Exception as exc:
+            st.error(f"Save failed: {exc}")
 else:
     st.info("Upload an EPUB to begin.")
