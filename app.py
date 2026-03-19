@@ -111,6 +111,24 @@ def normalize_alt_text(text: str, max_words: int = 30) -> str:
     return " ".join(words[:max_words])
 
 
+
+
+PLACEHOLDER_ALTS = {
+    "",
+    "illustration",
+    "illustrated",
+    "image",
+    "img",
+    "figure",
+    "photo",
+    "picture",
+    "graphic",
+}
+
+def is_placeholder_alt(text: str) -> bool:
+    return normalize_alt_text(text).lower() in PLACEHOLDER_ALTS
+
+
 def generate_alt_text_suggestion(image_bytes: bytes, image_path: str = "") -> str:
     mime_type = mimetypes.guess_type(image_path)[0] or "image/jpeg"
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
@@ -126,7 +144,7 @@ def generate_alt_text_suggestion(image_bytes: bytes, image_path: str = "") -> st
     )
 
     response = client.responses.create(
-        model="gpt-5.4",
+        model="gpt-4.1-mini",
         input=[
             {
                 "role": "user",
@@ -543,8 +561,9 @@ def generate_missing_alt_text(entries, updates, manifest_images) -> Tuple[int, i
         key = entry["key"]
         current_alt = normalize_alt_text(updates.get(key, {}).get("alt") or "")
         existing_alt = normalize_alt_text(entry.get("existing_alt", "") or "")
+        effective_alt = current_alt if current_alt else existing_alt
 
-        if current_alt or existing_alt:
+        if not is_placeholder_alt(effective_alt):
             skipped += 1
             continue
 
@@ -561,8 +580,11 @@ def generate_missing_alt_text(entries, updates, manifest_images) -> Tuple[int, i
 
         updates[key] = {"alt": suggestion}
         text_key = f"alt_text_{key}"
+        pending_key = f"pending_ai_{key}"
         if text_key in st.session_state:
-            st.session_state[text_key] = suggestion
+            st.session_state[pending_key] = suggestion
+        else:
+            updates[key] = {"alt": suggestion}
 
         st.session_state.ai_status[key] = "cached" if from_cache else "generated"
 
@@ -607,9 +629,9 @@ if uploaded_file:
 
     bulk_col1, bulk_col2 = st.columns(2)
     with bulk_col1:
-        if st.button("✨ Generate missing alt text only"):
+        if st.button("✨ Generate missing / placeholder alt text"):
             try:
-                with st.spinner("Generating alt text for missing images..."):
+                with st.spinner("Generating alt text for missing / placeholder images..."):
                     generated, reused_cache, skipped = generate_missing_alt_text(
                         entries, updates, manifest_images
                     )
@@ -656,6 +678,10 @@ if uploaded_file:
         del st.session_state[pending_key]
 
     st.text_area("Alt Text", key=text_key, height=120)
+
+    effective_alt = normalize_alt_text(st.session_state[text_key] or entry.get("existing_alt", "") or "")
+    if is_placeholder_alt(effective_alt):
+        st.caption("⚠️ Placeholder alt text detected. AI generation will replace it.")
 
     btn_col1, btn_col2 = st.columns(2)
     with btn_col1:
@@ -722,3 +748,4 @@ if uploaded_file:
             st.error(f"Save failed: {exc}")
 else:
     st.info("Upload an EPUB to begin.")
+
