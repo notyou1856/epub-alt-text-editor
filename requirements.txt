@@ -1,5 +1,6 @@
-streamlit
+streamlit>=1.33
 ebooklib
 beautifulsoup4
 lxml
 Pillow
+openai>=1.0
