@@ -15,12 +15,40 @@ from ebooklib import ITEM_DOCUMENT, epub
 from openai import OpenAI
 from PIL import Image, UnidentifiedImageError
 
+import os
+import streamlit as st
+
+# Detect environment
+ENV = os.getenv("ENVIRONMENT", "PROD")
+
+if ENV == "DEV":
+    st.markdown(
+        """
+        <div style="
+            background-color: #ff4b4b;
+            padding: 10px;
+            border-radius: 8px;
+            text-align: center;
+            font-weight: bold;
+            color: white;
+            margin-bottom: 10px;
+        ">
+            🚧 DEV ENVIRONMENT — TESTING ONLY 🚧
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
 
 # ----------------------------
 # Page config
 # ----------------------------
 st.set_page_config(page_title="EPUB Alt Text Editor (MVP)", layout="wide")
-st.title("📘 IDEA EPUB Alt Text Editor (Single-Image Paging)")
+#st.title("📘 IDEA EPUB Alt Text Editor (Single-Image Paging)")
+if ENV == "DEV":
+    st.title("🧪 IDEA EPUB Alt Text Editor (DEV)")
+else:
+    st.title("📘 IDEA EPUB Alt Text Editor (Single-Image Paging)")
 
 
 # ----------------------------
