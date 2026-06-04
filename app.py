@@ -7,6 +7,7 @@ import posixpath
 import tempfile
 import time
 import urllib.parse
+import zipfile
 from typing import Any, Dict, List, Tuple
 
 import streamlit as st
@@ -65,18 +66,92 @@ client = OpenAI(api_key=api_key)
 # ----------------------------
 # SAFE EPUB LOADER
 # ----------------------------
-def safe_read_epub(path: str):
-    """Attempt to load EPUB while tolerating bad nav/toc files."""
+def _epub_read_options() -> Dict[str, bool]:
+    return {
+        "ignore_ncx": True,
+        "ignore_nav": True,
+    }
+
+
+def _zip_normalized_names(epub_zip: zipfile.ZipFile) -> set[str]:
+    return {norm_href(name) for name in epub_zip.namelist()}
+
+
+def find_missing_manifest_items(path: str) -> List[str]:
+    """Find OPF manifest files that are absent from the EPUB archive."""
+    missing: List[str] = []
+
+    with zipfile.ZipFile(path, "r") as epub_zip:
+        archive_names = _zip_normalized_names(epub_zip)
+        try:
+            container_xml = epub_zip.read("META-INF/container.xml")
+        except KeyError:
+            return missing
+
+        container_soup = BeautifulSoup(container_xml, "xml")
+        rootfile = container_soup.find("rootfile")
+        opf_path = norm_href(rootfile.get("full-path", "") if rootfile else "")
+        if not opf_path:
+            return missing
+
+        try:
+            opf_xml = epub_zip.read(opf_path)
+        except KeyError:
+            return [opf_path]
+
+        opf_dir = posixpath.dirname(opf_path)
+        opf_soup = BeautifulSoup(opf_xml, "xml")
+        for item in opf_soup.find_all("item"):
+            href = item.get("href", "")
+            if not href:
+                continue
+            resolved_href = norm_href(posixpath.join(opf_dir, href))
+            if resolved_href and resolved_href not in archive_names:
+                missing.append(resolved_href)
+
+    return missing
+
+
+def read_epub_with_missing_placeholders(path: str, missing_items: List[str]) -> epub.EpubBook:
+    """Load malformed EPUBs by adding temporary placeholder files to a copied archive."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
+        tmp_path = tmp.name
+
     try:
-        return epub.read_epub(
-            path,
-            options={
-                "ignore_ncx": True,
-                "ignore_nav": True,
-            },
-        )
-    except Exception:
-        return epub.read_epub(path)
+        with zipfile.ZipFile(path, "r") as source_zip, zipfile.ZipFile(
+            tmp_path, "w", compression=zipfile.ZIP_DEFLATED
+        ) as repaired_zip:
+            for item in source_zip.infolist():
+                repaired_zip.writestr(item, source_zip.read(item.filename))
+
+            existing_names = _zip_normalized_names(source_zip)
+            for missing_href in missing_items:
+                href = norm_href(missing_href)
+                if href and href not in existing_names:
+                    repaired_zip.writestr(href, b"")
+
+        book = epub.read_epub(tmp_path, options=_epub_read_options())
+        book._missing_archive_items = {norm_href(item) for item in missing_items}
+        return book
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def safe_read_epub(path: str):
+    """Attempt to load EPUB while tolerating bad nav/toc and missing manifest files."""
+    try:
+        return epub.read_epub(path, options=_epub_read_options())
+    except Exception as first_exc:
+        try:
+            return epub.read_epub(path)
+        except Exception:
+            missing_items = find_missing_manifest_items(path)
+            if not missing_items:
+                raise first_exc
+            return read_epub_with_missing_placeholders(path, missing_items)
 
 
 # ----------------------------
