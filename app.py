@@ -20,11 +20,13 @@ from ebooklib import ITEM_DOCUMENT, epub
 from openai import OpenAI
 from PIL import Image, UnidentifiedImageError
 
-import os
-import streamlit as st
-
 # Detect environment
 ENV = os.getenv("ENVIRONMENT", "PROD")
+
+# ----------------------------
+# Page config
+# ----------------------------
+st.set_page_config(page_title="EPUB Alt Text Editor (MVP)", layout="wide")
 
 if ENV == "DEV":
     st.markdown(
@@ -38,22 +40,14 @@ if ENV == "DEV":
             color: white;
             margin-bottom: 10px;
         ">
-            🚧 DEV ENVIRONMENT — TESTING ONLY 🚧
+            DEV ENVIRONMENT - TESTING ONLY
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
-
-
-# ----------------------------
-# Page config
-# ----------------------------
-st.set_page_config(page_title="EPUB Alt Text Editor (MVP)", layout="wide")
-#st.title("📘 IDEA EPUB Alt Text Editor (Single-Image Paging)")
-if ENV == "DEV":
-    st.title("🧪 IDEA EPUB Alt Text Editor (DEV)")
+    st.title("IDEA EPUB Alt Text Editor (DEV)")
 else:
-    st.title("📘 IDEA EPUB Alt Text Editor (Single-Image Paging)")
+    st.title("IDEA EPUB Alt Text Editor (Single-Image Paging)")
 
 
 # ----------------------------
@@ -143,10 +137,14 @@ def read_epub_with_missing_placeholders(path: str, missing_items: List[str]) -> 
 def safe_read_epub(path: str):
     """Attempt to load EPUB while tolerating bad nav/toc and missing manifest files."""
     try:
-        return epub.read_epub(path, options=_epub_read_options())
+        book = epub.read_epub(path, options=_epub_read_options())
+        book._missing_archive_items = set()
+        return book
     except Exception as first_exc:
         try:
-            return epub.read_epub(path)
+            book = epub.read_epub(path)
+            book._missing_archive_items = set()
+            return book
         except Exception:
             missing_items = find_missing_manifest_items(path)
             if not missing_items:
@@ -284,37 +282,32 @@ def extract_image_entries(
 
     entries: List[Dict[str, Any]] = []
     for doc in doc_items:
-        doc_href = getattr(doc, "file_name", "") or ""
+        doc_href = norm_href(getattr(doc, "file_name", "") or "")
+        seen_counts: Dict[str, int] = {}
 
         try:
             raw = doc.get_content()
-            html = raw.decode("utf-8", errors="ignore")
-            soup = BeautifulSoup(html, "html.parser")
+            doc_html = raw.decode("utf-8", errors="ignore")
+            soup = BeautifulSoup(doc_html, "html.parser")
         except Exception:
             continue
 
         for img in soup.find_all("img"):
-            src = img.get("src", "")
+            src = norm_href(img.get("src", "") or "")
             if not src:
                 continue
 
             resolved = resolve_img_href(doc_href, src)
             alt = (img.get("alt") or "").strip()
-            occ_idx = len(
-                [
-                    e
-                    for e in entries
-                    if e.get("doc_href") == norm_href(doc_href)
-                    and e.get("src") == norm_href(src)
-                ]
-            )
-            key = f"{norm_href(doc_href)}|{norm_href(src)}|{occ_idx}"
+            occ_idx = seen_counts.get(src, 0)
+            seen_counts[src] = occ_idx + 1
+            key = f"{doc_href}|{src}|{occ_idx}"
 
             entries.append(
                 {
                     "key": key,
-                    "doc_href": norm_href(doc_href),
-                    "src": norm_href(src),
+                    "doc_href": doc_href,
+                    "src": src,
                     "resolved_href": resolved,
                     "existing_alt": alt,
                 }
@@ -332,13 +325,53 @@ PREFLIGHT_SCOPE_MESSAGE = (
 )
 
 
-def _new_issue(severity: str, check: str, detail: str = "", count: int = 0) -> Dict[str, Any]:
+def _location(
+    document: str = "",
+    element: str = "",
+    reference: str = "",
+    detail: str = "",
+    context: str = "",
+) -> Dict[str, str]:
     return {
+        "document": document,
+        "element": element,
+        "reference": reference,
+        "detail": detail,
+        "context": context,
+    }
+
+
+def _text_snippet(value: Any, max_chars: int = 140) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 1].rstrip()}..."
+
+
+def _tag_context(tag: Any, max_chars: int = 140) -> str:
+    if tag is None:
+        return ""
+    if tag.name == "img":
+        return _text_snippet(tag.get("alt") or tag.get("title") or tag.get("aria-label") or "", max_chars)
+    return _text_snippet(tag.get_text(" ", strip=True), max_chars)
+
+
+def _new_issue(
+    severity: str,
+    check: str,
+    detail: str = "",
+    count: int = 0,
+    locations: List[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    issue = {
         "severity": severity,
         "check": check,
         "detail": detail,
         "count": count,
     }
+    if locations:
+        issue["locations"] = locations
+    return issue
 
 
 def _spine_idref(entry: Any) -> str:
@@ -371,7 +404,9 @@ def analyze_epub_preflight(book: epub.EpubBook) -> Dict[str, Any]:
     referenced_images = {entry["resolved_href"] for entry in entries if entry.get("resolved_href")}
     missing_archive_items = set(getattr(book, "_missing_archive_items", set()) or set())
     missing_archive_image_items = {
-        href for href in missing_archive_items if href.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp"))
+        href
+        for href in missing_archive_items
+        if href.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp"))
     }
     manifest_ids = {
         str(getattr(item, "id", "") or "")
@@ -403,14 +438,21 @@ def analyze_epub_preflight(book: epub.EpubBook) -> Dict[str, Any]:
         "pagebreak_markers_count": 0,
         "missing_referenced_resources_from_image_src_attributes": 0,
     }
+
     issues: List[Dict[str, Any]] = []
-    alt_values: List[str] = []
+    alt_locations_by_text: Dict[str, List[Dict[str, str]]] = {}
     missing_manifest_hrefs: Set[str] = set()
-    missing_lang_docs: List[str] = []
-    duplicate_id_details: List[str] = []
-    heading_jump_details: List[str] = []
-    table_details: List[str] = []
-    empty_link_details: List[str] = []
+    missing_manifest_locations: List[Dict[str, str]] = []
+    missing_alt_locations: List[Dict[str, str]] = []
+    empty_alt_locations: List[Dict[str, str]] = []
+    placeholder_alt_locations: List[Dict[str, str]] = []
+    long_alt_locations: List[Dict[str, str]] = []
+    missing_lang_locations: List[Dict[str, str]] = []
+    duplicate_id_locations: List[Dict[str, str]] = []
+    heading_jump_locations: List[Dict[str, str]] = []
+    table_locations: List[Dict[str, str]] = []
+    empty_link_locations: List[Dict[str, str]] = []
+    parse_locations: List[Dict[str, str]] = []
 
     for doc in doc_items:
         doc_href = norm_href(getattr(doc, "file_name", "") or "")
@@ -418,42 +460,85 @@ def analyze_epub_preflight(book: epub.EpubBook) -> Dict[str, Any]:
             doc_html = doc.get_content().decode("utf-8", errors="ignore")
             soup = BeautifulSoup(doc_html, "html.parser")
         except Exception as exc:
-            issues.append(_new_issue("Needs Review", "Could not parse XHTML document", f"{doc_href}: {exc}", 1))
+            parse_locations.append(
+                _location(doc_href, "document", doc_href, "Could not parse XHTML document", str(exc))
+            )
             continue
 
         html_tag = soup.find("html")
         if not html_tag or not (html_tag.get("lang") or html_tag.get("xml:lang")):
             structure_counts["documents_missing_lang_or_xml_lang"] += 1
-            missing_lang_docs.append(doc_href)
+            missing_lang_locations.append(
+                _location(doc_href, "html", doc_href, "Document is missing lang or xml:lang")
+            )
 
-        ids = [str(tag.get("id")) for tag in soup.find_all(attrs={"id": True})]
-        for id_value, count in Counter(ids).items():
-            if count > 1:
-                extras = count - 1
-                structure_counts["duplicate_ids_in_xhtml"] += extras
-                duplicate_id_details.append(f"{doc_href}#{id_value} appears {count} times")
+        id_locations: Dict[str, List[Dict[str, str]]] = {}
+        for tag in soup.find_all(attrs={"id": True}):
+            id_value = str(tag.get("id") or "")
+            id_locations.setdefault(id_value, []).append(
+                _location(
+                    doc_href,
+                    tag.name or "element",
+                    f"id={id_value}",
+                    "Duplicate ID value",
+                    _tag_context(tag),
+                )
+            )
+        for id_value, locations in id_locations.items():
+            if len(locations) > 1:
+                structure_counts["duplicate_ids_in_xhtml"] += len(locations) - 1
+                duplicate_id_locations.extend(locations)
 
         last_heading_level = 0
+        last_heading_text = ""
         for heading in soup.find_all(re.compile(r"^h[1-6]$")):
             level = int(heading.name[1])
+            heading_text = _tag_context(heading)
             if last_heading_level and level > last_heading_level + 1:
                 structure_counts["heading_order_jumps"] += 1
-                heading_jump_details.append(f"{doc_href}: h{last_heading_level} to h{level}")
+                heading_jump_locations.append(
+                    _location(
+                        doc_href,
+                        heading.name,
+                        f"h{last_heading_level} to h{level}",
+                        "Heading level jumps over an intermediate level",
+                        heading_text or last_heading_text,
+                    )
+                )
             last_heading_level = level
+            last_heading_text = heading_text
 
         for table_index, table in enumerate(soup.find_all("table"), start=1):
             has_th = bool(table.find("th"))
             has_association = bool(table.find(attrs={"headers": True}) or table.find(attrs={"scope": True}))
             if not has_th and not has_association:
                 structure_counts["tables_without_th_or_header_associations"] += 1
-                table_details.append(f"{doc_href}: table {table_index}")
+                table_locations.append(
+                    _location(
+                        doc_href,
+                        "table",
+                        f"table {table_index}",
+                        "Table has no th, headers, or scope markers",
+                        _tag_context(table),
+                    )
+                )
 
-        for link in soup.find_all("a"):
-            has_target = bool((link.get("href") or "").strip() or (link.get("id") or "").strip() or (link.get("name") or "").strip())
+        for link_index, link in enumerate(soup.find_all("a"), start=1):
+            href = (link.get("href") or "").strip()
+            anchor_id = (link.get("id") or link.get("name") or "").strip()
+            has_target = bool(href or anchor_id)
             has_text = bool(link.get_text(" ", strip=True))
             if not has_target or not has_text:
                 structure_counts["empty_links_or_anchors"] += 1
-                empty_link_details.append(doc_href)
+                empty_link_locations.append(
+                    _location(
+                        doc_href,
+                        "a",
+                        href or anchor_id or f"a {link_index}",
+                        "Link or anchor is missing usable text or a target",
+                        _tag_context(link),
+                    )
+                )
 
         structure_counts["pagebreak_markers_count"] += len(
             soup.find_all(attrs={"epub:type": lambda value: value and "pagebreak" in str(value).split()})
@@ -462,43 +547,87 @@ def analyze_epub_preflight(book: epub.EpubBook) -> Dict[str, Any]:
             soup.find_all(attrs={"role": lambda value: str(value).lower() == "doc-pagebreak"})
         )
 
+        seen_img_counts: Dict[str, int] = {}
         for img in soup.find_all("img"):
-            src = img.get("src", "")
+            src = norm_href(img.get("src", "") or "")
             resolved = resolve_img_href(doc_href, src)
             alt_attr = img.get("alt")
             alt_text = (alt_attr or "").strip()
+            img_index = seen_img_counts.get(src, 0)
+            seen_img_counts[src] = img_index + 1
+            img_ref = resolved or src or f"img {img_index + 1}"
 
             if resolved and (resolved not in manifest_images or resolved in missing_archive_items):
                 missing_manifest_hrefs.add(resolved)
+                missing_manifest_locations.append(
+                    _location(
+                        doc_href,
+                        "img",
+                        img_ref,
+                        "Referenced image is missing from the manifest or EPUB archive",
+                        f"src={src}",
+                    )
+                )
 
             if not img.has_attr("alt"):
                 alt_counts["images_missing_alt_attribute"] += 1
+                missing_alt_locations.append(
+                    _location(doc_href, "img", img_ref, "Image is missing an alt attribute", f"src={src}")
+                )
             elif alt_text == "":
                 alt_counts["images_with_empty_alt"] += 1
+                empty_alt_locations.append(
+                    _location(doc_href, "img", img_ref, "Image has an empty alt attribute", f"src={src}")
+                )
             elif is_placeholder_alt(alt_text):
                 alt_counts["images_with_placeholder_alt"] += 1
+                placeholder_alt_locations.append(
+                    _location(doc_href, "img", img_ref, "Alt text appears to be a placeholder", alt_text)
+                )
 
             if len(alt_text.split()) > 30:
                 alt_counts["images_with_alt_text_over_30_words"] += 1
+                long_alt_locations.append(
+                    _location(doc_href, "img", img_ref, "Alt text is over 30 words", _text_snippet(alt_text))
+                )
 
             normalized = " ".join(alt_text.lower().split())
             if normalized:
-                alt_values.append(normalized)
+                alt_locations_by_text.setdefault(normalized, []).append(
+                    _location(doc_href, "img", img_ref, "Duplicate alt text value", _text_snippet(alt_text))
+                )
 
-    duplicate_alt_counts = Counter(alt_values)
+    if parse_locations:
+        issues.append(
+            _new_issue(
+                "Needs Review",
+                "Could not parse XHTML document",
+                "; ".join(location["document"] for location in parse_locations[:10]),
+                len(parse_locations),
+                parse_locations,
+            )
+        )
+
+    duplicate_alt_locations: List[Dict[str, str]] = []
+    for locations in alt_locations_by_text.values():
+        if len(locations) > 1:
+            duplicate_alt_locations.extend(locations)
     alt_counts["duplicate_alt_text_count"] = sum(
-        count - 1 for count in duplicate_alt_counts.values() if count > 1
+        len(locations) - 1 for locations in alt_locations_by_text.values() if len(locations) > 1
     )
     alt_counts["image_references_missing_from_manifest"] = len(missing_manifest_hrefs)
-    alt_counts["unreferenced_image_files"] = len((set(manifest_images) - missing_archive_image_items) - referenced_images)
+    unreferenced_image_files = (set(manifest_images) - missing_archive_image_items) - referenced_images
+    alt_counts["unreferenced_image_files"] = len(unreferenced_image_files)
     structure_counts["missing_referenced_resources_from_image_src_attributes"] = len(missing_manifest_hrefs)
 
-    malformed_spine_details: List[str] = []
+    malformed_spine_locations: List[Dict[str, str]] = []
     for entry in getattr(book, "spine", []) or []:
         idref = _spine_idref(entry)
         if not idref or idref not in manifest_ids:
-            malformed_spine_details.append(str(entry))
-    structure_counts["missing_or_malformed_spine_entries"] = len(malformed_spine_details)
+            malformed_spine_locations.append(
+                _location("package.opf", "spine", idref or str(entry), "Spine item does not resolve to a manifest item")
+            )
+    structure_counts["missing_or_malformed_spine_entries"] = len(malformed_spine_locations)
 
     has_nav = any(
         "nav" in _item_properties(item)
@@ -507,40 +636,53 @@ def analyze_epub_preflight(book: epub.EpubBook) -> Dict[str, Any]:
     )
     has_ncx = any((getattr(item, "media_type", "") or "") == "application/x-dtbncx+xml" for item in book.get_items())
     has_toc = bool(getattr(book, "toc", None))
+    missing_nav_locations: List[Dict[str, str]] = []
     if not (has_nav or has_ncx or has_toc):
         structure_counts["missing_nav_toc"] = 1
+        missing_nav_locations.append(
+            _location("package.opf", "navigation", "nav/toc", "No EPUB nav, NCX, or parsed TOC was detected")
+        )
 
     unreferenced_missing_images = missing_archive_image_items - referenced_images
+    unreferenced_locations = [
+        _location("package.opf", "manifest image", href, "Image file is in the manifest but not referenced in XHTML")
+        for href in sorted(unreferenced_image_files)
+    ]
+    unreferenced_missing_locations = [
+        _location("package.opf", "manifest image", href, "Manifest image is also missing from the EPUB archive")
+        for href in sorted(unreferenced_missing_images)
+    ]
+
     if missing_manifest_hrefs:
-        issues.append(_new_issue("Critical", "Missing image files from manifest", ", ".join(sorted(missing_manifest_hrefs)[:10]), len(missing_manifest_hrefs)))
+        issues.append(_new_issue("Critical", "Missing image files from manifest", ", ".join(sorted(missing_manifest_hrefs)[:10]), len(missing_manifest_hrefs), missing_manifest_locations))
     if unreferenced_missing_images:
-        issues.append(_new_issue("Critical", "Missing unreferenced image files", ", ".join(sorted(unreferenced_missing_images)[:10]), len(unreferenced_missing_images)))
+        issues.append(_new_issue("Critical", "Missing unreferenced image files", ", ".join(sorted(unreferenced_missing_images)[:10]), len(unreferenced_missing_images), unreferenced_missing_locations))
     if alt_counts["images_missing_alt_attribute"]:
-        issues.append(_new_issue("Needs Review", "Images missing alt attribute", "", alt_counts["images_missing_alt_attribute"]))
+        issues.append(_new_issue("Needs Review", "Images missing alt attribute", "", alt_counts["images_missing_alt_attribute"], missing_alt_locations))
     if alt_counts["images_with_empty_alt"]:
-        issues.append(_new_issue("Needs Review", "Images with empty alt", "", alt_counts["images_with_empty_alt"]))
+        issues.append(_new_issue("Needs Review", "Images with empty alt", "", alt_counts["images_with_empty_alt"], empty_alt_locations))
     if alt_counts["images_with_placeholder_alt"]:
-        issues.append(_new_issue("Needs Review", "Images with placeholder alt", "", alt_counts["images_with_placeholder_alt"]))
+        issues.append(_new_issue("Needs Review", "Images with placeholder alt", "", alt_counts["images_with_placeholder_alt"], placeholder_alt_locations))
     if alt_counts["duplicate_alt_text_count"]:
-        issues.append(_new_issue("Needs Review", "Duplicate alt text", "", alt_counts["duplicate_alt_text_count"]))
+        issues.append(_new_issue("Needs Review", "Duplicate alt text", "", alt_counts["duplicate_alt_text_count"], duplicate_alt_locations))
     if structure_counts["duplicate_ids_in_xhtml"]:
-        issues.append(_new_issue("Needs Review", "Duplicate IDs in XHTML", "; ".join(duplicate_id_details[:10]), structure_counts["duplicate_ids_in_xhtml"]))
+        issues.append(_new_issue("Needs Review", "Duplicate IDs in XHTML", "", structure_counts["duplicate_ids_in_xhtml"], duplicate_id_locations))
     if structure_counts["documents_missing_lang_or_xml_lang"]:
-        issues.append(_new_issue("Needs Review", "Documents missing lang or xml:lang", ", ".join(missing_lang_docs[:10]), structure_counts["documents_missing_lang_or_xml_lang"]))
+        issues.append(_new_issue("Needs Review", "Documents missing lang or xml:lang", "", structure_counts["documents_missing_lang_or_xml_lang"], missing_lang_locations))
     if structure_counts["tables_without_th_or_header_associations"]:
-        issues.append(_new_issue("Needs Review", "Tables without th or header associations", ", ".join(table_details[:10]), structure_counts["tables_without_th_or_header_associations"]))
+        issues.append(_new_issue("Needs Review", "Tables without th or header associations", "", structure_counts["tables_without_th_or_header_associations"], table_locations))
     if structure_counts["empty_links_or_anchors"]:
-        issues.append(_new_issue("Needs Review", "Empty links or anchors", ", ".join(sorted(set(empty_link_details))[:10]), structure_counts["empty_links_or_anchors"]))
+        issues.append(_new_issue("Needs Review", "Empty links or anchors", "", structure_counts["empty_links_or_anchors"], empty_link_locations))
     if alt_counts["images_with_alt_text_over_30_words"]:
-        issues.append(_new_issue("Warning", "Alt text over 30 words", "", alt_counts["images_with_alt_text_over_30_words"]))
+        issues.append(_new_issue("Warning", "Alt text over 30 words", "", alt_counts["images_with_alt_text_over_30_words"], long_alt_locations))
     if structure_counts["heading_order_jumps"]:
-        issues.append(_new_issue("Warning", "Heading order jumps", "; ".join(heading_jump_details[:10]), structure_counts["heading_order_jumps"]))
+        issues.append(_new_issue("Warning", "Heading order jumps", "", structure_counts["heading_order_jumps"], heading_jump_locations))
     if alt_counts["unreferenced_image_files"]:
-        issues.append(_new_issue("Warning", "Unreferenced image files", "", alt_counts["unreferenced_image_files"]))
+        issues.append(_new_issue("Warning", "Unreferenced image files", "", alt_counts["unreferenced_image_files"], unreferenced_locations))
     if structure_counts["missing_or_malformed_spine_entries"]:
-        issues.append(_new_issue("Warning", "Missing or malformed spine entries", "; ".join(malformed_spine_details[:10]), structure_counts["missing_or_malformed_spine_entries"]))
+        issues.append(_new_issue("Warning", "Missing or malformed spine entries", "", structure_counts["missing_or_malformed_spine_entries"], malformed_spine_locations))
     if structure_counts["missing_nav_toc"]:
-        issues.append(_new_issue("Warning", "Missing nav/toc", "", 1))
+        issues.append(_new_issue("Warning", "Missing nav/toc", "", 1, missing_nav_locations))
 
     if any(issue["severity"] == "Critical" for issue in issues):
         summary = "Do not process until fixed"
@@ -562,6 +704,26 @@ def display_count_rows(rows: List[Tuple[str, int]]) -> None:
         st.write(f"**{label}:** {value}")
 
 
+def preflight_location_rows(report: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for issue in report.get("issues", []):
+        for location in issue.get("locations", []):
+            rows.append(
+                {
+                    "category": "Issue Location",
+                    "check": issue.get("check", ""),
+                    "severity": issue.get("severity", ""),
+                    "count": 1,
+                    "document": location.get("document", ""),
+                    "element": location.get("element", ""),
+                    "reference": location.get("reference", ""),
+                    "detail": location.get("detail", issue.get("detail", "")),
+                    "context": location.get("context", ""),
+                }
+            )
+    return rows
+
+
 def preflight_export_rows(report: Dict[str, Any]) -> List[Dict[str, Any]]:
     alt_counts = report.get("alt_text_readiness", {})
     structure_counts = report.get("epub_structure_health", {})
@@ -570,9 +732,7 @@ def preflight_export_rows(report: Dict[str, Any]) -> List[Dict[str, Any]]:
     issue_aliases = {
         "Image references missing from manifest": "Missing image files from manifest",
         "Missing referenced resources from image src attributes": "Missing image files from manifest",
-        "Duplicate alt text count": "Duplicate alt text",
     }
-
     checks = [
         ("Alt Text Readiness", "Total image files in manifest", "total_image_files_in_manifest", "Pass"),
         ("Alt Text Readiness", "Total image references in XHTML", "total_image_references_in_xhtml", "Pass"),
@@ -610,7 +770,11 @@ def preflight_export_rows(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "check": label,
                 "severity": severity,
                 "count": count,
+                "document": "",
+                "element": "",
+                "reference": "",
                 "detail": matching_issue.get("detail", "") if matching_issue else "",
+                "context": "",
             }
         )
 
@@ -620,15 +784,30 @@ def preflight_export_rows(report: Dict[str, Any]) -> List[Dict[str, Any]]:
             "check": "Current tool scope",
             "severity": "Pass",
             "count": "",
+            "document": "",
+            "element": "",
+            "reference": "",
             "detail": PREFLIGHT_SCOPE_MESSAGE,
+            "context": "",
         }
     )
+    rows.extend(preflight_location_rows(report))
     return rows
 
 
 def preflight_report_to_csv(report: Dict[str, Any]) -> bytes:
     output = io.StringIO()
-    fieldnames = ["category", "check", "severity", "count", "detail"]
+    fieldnames = [
+        "category",
+        "check",
+        "severity",
+        "count",
+        "document",
+        "element",
+        "reference",
+        "detail",
+        "context",
+    ]
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
     writer.writerows(preflight_export_rows(report))
@@ -645,7 +824,11 @@ def preflight_report_to_html(report: Dict[str, Any], file_name: str = "") -> str
         f"<td>{html.escape(str(row['check']))}</td>"
         f"<td>{html.escape(str(row['severity']))}</td>"
         f"<td>{html.escape(str(row['count']))}</td>"
+        f"<td>{html.escape(str(row['document']))}</td>"
+        f"<td>{html.escape(str(row['element']))}</td>"
+        f"<td>{html.escape(str(row['reference']))}</td>"
         f"<td>{html.escape(str(row['detail']))}</td>"
+        f"<td>{html.escape(str(row['context']))}</td>"
         "</tr>"
         for row in rows
     )
@@ -658,11 +841,11 @@ def preflight_report_to_html(report: Dict[str, Any], file_name: str = "") -> str
     body {{ font-family: Arial, sans-serif; margin: 2rem; color: #1f2933; }}
     h1 {{ margin-bottom: 0.25rem; }}
     .summary {{ font-size: 1.1rem; font-weight: 700; margin: 1rem 0; }}
-    table {{ border-collapse: collapse; width: 100%; }}
-    th, td {{ border: 1px solid #d9dee3; padding: 0.55rem; text-align: left; vertical-align: top; }}
+    table {{ border-collapse: collapse; width: 100%; font-size: 0.9rem; }}
+    th, td {{ border: 1px solid #d9dee3; padding: 0.5rem; text-align: left; vertical-align: top; }}
     th {{ background: #f3f5f7; }}
-    td:nth-child(3), td:nth-child(4) {{ white-space: nowrap; }}
-    @media print {{ body {{ margin: 0.5in; }} }}
+    td:nth-child(3), td:nth-child(4), td:nth-child(6) {{ white-space: nowrap; }}
+    @media print {{ body {{ margin: 0.5in; }} table {{ font-size: 0.75rem; }} }}
   </style>
 </head>
 <body>
@@ -676,7 +859,11 @@ def preflight_report_to_html(report: Dict[str, Any], file_name: str = "") -> str
         <th>Check</th>
         <th>Severity</th>
         <th>Count</th>
+        <th>Document</th>
+        <th>Element</th>
+        <th>Reference</th>
         <th>Detail</th>
+        <th>Context</th>
       </tr>
     </thead>
     <tbody>
@@ -742,6 +929,7 @@ def display_preflight_report(report: Dict[str, Any], file_name: str = "") -> Non
     with scope_tab:
         st.write(PREFLIGHT_SCOPE_MESSAGE)
 
+    location_rows = preflight_location_rows(report)
     with st.expander("Preflight issue details"):
         if not issues:
             st.write("Pass: no preflight issues found.")
@@ -749,6 +937,25 @@ def display_preflight_report(report: Dict[str, Any], file_name: str = "") -> Non
             for issue in issues:
                 detail = f" - {issue['detail']}" if issue.get("detail") else ""
                 st.write(f"**{issue['severity']}**: {issue['check']} ({issue.get('count', 0)}){detail}")
+
+        if location_rows:
+            st.write("**Where to look**")
+            st.dataframe(
+                [
+                    {
+                        "Severity": row["severity"],
+                        "Issue": row["check"],
+                        "Document": row["document"],
+                        "Element": row["element"],
+                        "Reference": row["reference"],
+                        "Detail": row["detail"],
+                        "Context": row["context"],
+                    }
+                    for row in location_rows
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
 
     export_col1, export_col2 = st.columns(2)
     with export_col1:
@@ -765,6 +972,7 @@ def display_preflight_report(report: Dict[str, Any], file_name: str = "") -> Non
             file_name="preflight-report.html",
             mime="text/html",
         )
+
 
 def apply_updates_to_book(
     book: epub.EpubBook, updates: Dict[str, Dict[str, Any]]
@@ -1092,12 +1300,19 @@ def reset_for_new_upload(epub_bytes: bytes) -> None:
         tmp.write(epub_bytes)
         tmp_path = tmp.name
 
-    book = safe_read_epub(tmp_path)
-    entries, manifest = extract_image_entries(book)
+    try:
+        book = safe_read_epub(tmp_path)
+        entries, manifest = extract_image_entries(book)
+        preflight_report = analyze_epub_preflight(book)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
     st.session_state.entries = entries
     st.session_state.manifest_images = manifest
-    st.session_state.preflight_report = analyze_epub_preflight(book)
+    st.session_state.preflight_report = preflight_report
 
     for entry in entries:
         st.session_state.updates[entry["key"]] = {
@@ -1186,7 +1401,7 @@ if uploaded_file:
 
     bulk_col1, bulk_col2 = st.columns(2)
     with bulk_col1:
-        if st.button("✨ Generate missing / placeholder alt text"):
+        if st.button("Generate missing / placeholder alt text"):
             try:
                 with st.spinner("Generating alt text for missing / placeholder images..."):
                     generated, reused_cache, skipped = generate_missing_alt_text(
@@ -1238,11 +1453,11 @@ if uploaded_file:
 
     effective_alt = normalize_alt_text(st.session_state[text_key] or entry.get("existing_alt", "") or "")
     if is_placeholder_alt(effective_alt):
-        st.caption("⚠️ Placeholder alt text detected. AI generation will replace it.")
+        st.caption("Placeholder alt text detected. AI generation will replace it.")
 
     btn_col1, btn_col2 = st.columns(2)
     with btn_col1:
-        if st.button("✨ Generate alt text suggestion", key=f"gen_{key}"):
+        if st.button("Generate alt text suggestion", key=f"gen_{key}"):
             if not img_item:
                 st.warning("No image file was found for this entry.")
             else:
@@ -1280,15 +1495,21 @@ if uploaded_file:
 
     st.markdown("---")
 
-    if st.button("💾 Save updated EPUB"):
+    if st.button("Save updated EPUB"):
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
                 tmp.write(st.session_state.book_bytes)
                 tmp_path = tmp.name
 
-            book = safe_read_epub(tmp_path)
-            docs_modified, tags_modified = apply_updates_to_book(book, updates)
-            output, save_notes = write_book_with_fallbacks(book)
+            try:
+                book = safe_read_epub(tmp_path)
+                docs_modified, tags_modified = apply_updates_to_book(book, updates)
+                output, save_notes = write_book_with_fallbacks(book)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
             success_msg = f"Saved. Docs modified: {docs_modified}, images updated: {tags_modified}"
             st.success(success_msg)
